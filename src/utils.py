@@ -12,6 +12,11 @@ import streamlit as st
 import aiohttp
 import asyncio
 
+import weaviate
+from collections import defaultdict
+from weaviate.classes.init import Auth
+from weaviate.classes.query import MetadataQuery, Filter
+
 os.environ["XATA_API_KEY"] = st.secrets["xata_api_key"]
 os.environ["XATA_DATABASE_URL"] = st.secrets["xata_db_url"]
 os.environ["LANGCHAIN_VERBOSE"] = str(st.secrets["langchain_verbose"])
@@ -19,11 +24,13 @@ os.environ["PASSWORD"] = st.secrets["password"]
 os.environ["X_REGION"] = st.secrets["x_region"]
 os.environ["EMAIL"] = st.secrets["email"]
 os.environ["PW"] = st.secrets["pw"]
+os.environ["X_API_KEY"] = st.secrets["x_api_key"]
 os.environ["REMOTE_BEARER_TOKEN"] = st.secrets["bearer_token"]
 os.environ["END_POINT"] = st.secrets["end_point"]
 
-os.environ["QIANFAN_AK"] = st.secrets["qianfan_ak"]
-os.environ["QIANFAN_SK"] = st.secrets["qianfan_sk"]
+# os.environ["QIANFAN_AK"] = st.secrets["qianfan_ak"]
+# os.environ["QIANFAN_SK"] = st.secrets["qianfan_sk"]
+os.environ["DEEPSEEK_API_KEY"] = st.secrets["deepseek_api_key"]
 
 
 from langchain.callbacks.base import BaseCallbackHandler
@@ -160,8 +167,10 @@ def check_password():
 #     return text
 
 
-def func_calling_chain(api_key, llm_model, openai_api_base):
+def func_calling_chain():
     """
+    api_key, llm_model, openai_api_base
+    
     Creates and returns a function calling chain for extracting query and filter information from a chat history.
 
     :returns: An object representing the function calling chain configured to generate structured output based on the provided JSON schema and chat prompt template.
@@ -305,12 +314,20 @@ def func_calling_chain(api_key, llm_model, openai_api_base):
     #     openai_api_base=openai_api_base,
     # )
 
-    llm_func_calling = ChatOpenAI(
-        api_key=st.secrets["openai_api_key_zhipu"],
-        model_name=st.secrets["llm_model_zhipu"],
-        temperature=0.1,
-        streaming=False,
-        openai_api_base=st.secrets["openai_api_base_zhipu"],
+    # llm_func_calling = ChatOpenAI(
+    #     api_key=st.secrets["openai_api_key_zhipu"],
+    #     model_name=st.secrets["llm_model_zhipu"],
+    #     temperature=0.1,
+    #     streaming=False,
+    #     openai_api_base=st.secrets["openai_api_base_zhipu"],
+    # )
+
+    llm_func_calling = ChatDeepSeek(
+        model=st.secrets["llm_chatmodel_ds"],
+        temperature=0,
+        max_tokens=None,
+        timeout=None,
+        max_retries=2,
     )
 
     func_calling_chain = prompt_func_calling | llm_func_calling.with_structured_output(
@@ -353,8 +370,7 @@ async def concurrent_search_service(urls: list, query: str, top_k: int = 8):
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ['REMOTE_BEARER_TOKEN']}",
-        "email": os.environ["EMAIL"],
-        "password": os.environ["PW"],
+        "x-api-key": os.environ["X_API_KEY"],
         "x-region": os.environ["X_REGION"],
     }
 
@@ -363,7 +379,7 @@ async def concurrent_search_service(urls: list, query: str, top_k: int = 8):
         return await asyncio.gather(*tasks)
 
 
-def main_chain(api_key, llm_model, openai_api_base, baidu_llm):
+def main_chain():
     """
     Creates and returns a main Large Language Model (LLM) chain configured to produce responses only to science-related queries while avoiding sensitive topics.
 
@@ -416,13 +432,13 @@ def main_chain(api_key, llm_model, openai_api_base, baidu_llm):
     # )
 
     llm_chat = ChatDeepSeek(
-    model=st.secrets["llm_model_ds"],
-    api_key=st.secrets["openai_api_key_ds"],
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2
-    )
+        model=st.secrets["llm_reasonmodel_ds"],
+        api_key=st.secrets["deepseek_api_key"],
+        temperature=0,
+        max_tokens=None,
+        timeout=None,
+        max_retries=2
+        )
 
 
     template = """{input}"""
@@ -744,3 +760,129 @@ def count_chat_history(username: str, beginDatetime: datetime):
         return records[0]["c"]
     else:
         return 0
+
+def weaviate_connection(collection_name):
+    client = weaviate.connect_to_custom(
+        http_host=st.secrets[
+            "weaviate_http_host"
+        ],  # Hostname for the HTTP API connection
+        http_port=st.secrets["weaviate_http_port"],  # Default is 80, WCD uses 443
+        http_secure=False,  # Whether to use https (secure) for the HTTP API connection
+        grpc_host=st.secrets[
+            "weaviate_grpc_host"
+        ],  # Hostname for the gRPC API connection
+        grpc_port=st.secrets["weaviate_grpc_port"],  # Default is 50051, WCD uses 443
+        grpc_secure=False,  # Whether to use a secure channel for the gRPC API connection
+        auth_credentials=Auth.api_key(
+            st.secrets["weaviate_api_key"]
+        ),  # API key for authentication
+    )
+
+    collection = client.collections.get(collection_name)
+
+    return collection
+
+
+def weaviate_hybrid_search_extention(collection, query, top_k: int = 8, ext_k: int = 1):
+    hybrid_search_results = collection.query.hybrid(
+        query=query,
+        target_vector="content",
+        query_properties=["content"],
+        alpha=0.3,
+        return_metadata=MetadataQuery(score=True, explain_score=True),
+        limit=top_k,
+    )
+    if ext_k == 0:
+        docs_list = []
+        for doc in hybrid_search_results.objects:
+            docs_list.append(
+                {
+                    "content": doc.properties["content"],
+                    "source": doc.properties["source"],
+                }
+            )
+        return docs_list
+
+    else:
+        original_search_results = hybrid_search_results.objects
+
+        doc_chunks = defaultdict(list)
+        doc_sources = {}
+        added_chunks = set()
+
+        for result in original_search_results:
+            properties = result.properties
+            content = properties["content"]
+            doc_chunk_id = properties["doc_chunk_id"]
+            doc_uuid, chunk_id_str = doc_chunk_id.split("_")
+            chunk_id = int(chunk_id_str)
+
+            if doc_uuid not in doc_sources and "source" in properties:
+                doc_sources[doc_uuid] = properties["source"]
+
+            if (doc_uuid, chunk_id) not in added_chunks:
+                doc_chunks[doc_uuid].append((chunk_id, content))
+                added_chunks.add((doc_uuid, chunk_id))
+
+            # Extend backward and forward using ext_k
+            for i in range(1, ext_k + 1):
+                # Fetch previous chunk
+                target_chunk_before = chunk_id - i
+                if (
+                    target_chunk_before >= 0
+                    and (doc_uuid, target_chunk_before) not in added_chunks
+                ):
+                    before_response = collection.query.fetch_objects(
+                        filters=Filter.by_property("doc_chunk_id").equal(
+                            f"{doc_uuid}_{target_chunk_before}"
+                        ),
+                    )
+                    if before_response.objects:
+                        before_obj = before_response.objects[0]
+                        before_content = before_obj.properties["content"]
+                        if (
+                            doc_uuid not in doc_sources
+                            and "source" in before_obj.properties
+                        ):
+                            doc_sources[doc_uuid] = before_obj.properties["source"]
+                        doc_chunks[doc_uuid].append(
+                            (target_chunk_before, before_content)
+                        )
+                        added_chunks.add((doc_uuid, target_chunk_before))
+
+                # Fetch following chunk
+                total_chunk_count = collection.aggregate.over_all(
+                    total_count=True,
+                    filters=Filter.by_property("doc_chunk_id").like(f"{doc_uuid}*"),
+                ).total_count
+                target_chunk_after = chunk_id + i
+                if (
+                    target_chunk_after <= total_chunk_count
+                    and (doc_uuid, target_chunk_after) not in added_chunks
+                ):
+                    after_response = collection.query.fetch_objects(
+                        filters=Filter.by_property("doc_chunk_id").equal(
+                            f"{doc_uuid}_{target_chunk_after}"
+                        ),
+                    )
+                    if after_response.objects:
+                        after_obj = after_response.objects[0]
+                        after_content = after_obj.properties["content"]
+                        if (
+                            doc_uuid not in doc_sources
+                            and "source" in after_obj.properties
+                        ):
+                            doc_sources[doc_uuid] = after_obj.properties["source"]
+                        doc_chunks[doc_uuid].append((target_chunk_after, after_content))
+                        added_chunks.add((doc_uuid, target_chunk_after))
+
+        for doc_uuid in doc_chunks:
+            doc_chunks[doc_uuid].sort(key=lambda x: x[0])
+
+        docs_list = []
+        for doc_uuid, chunks in doc_chunks.items():
+            combined_content = "".join(chunk_content for _, chunk_content in chunks)
+            source = doc_sources.get(doc_uuid, "")
+            docs_list.append({"content": combined_content, "source": source})
+
+        return docs_list

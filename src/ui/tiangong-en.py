@@ -111,6 +111,7 @@ ui_data = {
     "sidebar_expander_title": "信息来源 / Sources:",
     "search_journal_paper_checkbox_label": "📂 期刊文献 / Journal Paper",
     "search_internet_checkbox_label": "🌐 互联网 / Internet",
+    "search_internal_checkbox_label": "📄 内部资料/Internal Resources",
     "search_report_checkbox_label": "📄 报告 / Report",
     "search_standard_checkbox_label": "📘 标准 / Standard",
     "search_docs_checkbox_label": "Documents / 文档",
